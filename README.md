@@ -1,4 +1,4 @@
-# Research Agent UI
+# Spectron: A Multi-Agent Framework for Epistemic Reasoning
 
 A chat interface for a multi-stage research pipeline. The frontend is React (JavaScript, Vite). The backend is a thin FastAPI wrapper around `research_agent.py` that streams one JSON line per pipeline stage, so the UI shows what the pipeline is actually doing as it runs.
 
