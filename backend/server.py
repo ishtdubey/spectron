@@ -1,7 +1,16 @@
+"""
+Streaming HTTP wrapper around GroqDeepResearchPipeline (research_agent.py).
+
+Run:
+    cd backend
+    pip install fastapi uvicorn pydantic openai python-dotenv tavily-python
+    uvicorn server:app --reload --port 8000
+
+Set MOCK=1 to run without API keys.
+"""
 import asyncio
 import json
 import os
-import re
 from typing import AsyncIterator
 
 from dotenv import load_dotenv
@@ -48,34 +57,44 @@ async def run_mock(query: str) -> AsyncIterator[str]:
     await asyncio.sleep(0.4)
     evidence = [
         {
-            "id": f"doc_{p.lower()}_{i}",
-            "title": f"Sample Source {i} for {p}",
-            "source": f"{p} Research Repository",
-            "url": f"https://example.com/{p.lower()}-{i}",
-            "perspective": p,
-            "content": f"Sample evidence {i} about '{query}' from the {p} view.",
+            "id": f"doc_{i}",
+            "title": f"Sample Source {i}",
+            "source": f"Research Repository {i}",
+            "url": f"https://example.com/source-{i}",
+            "perspective": "General",
+            "content": f"Sample evidence {i} about '{query}'.",
             "relevance_score": 0.95 - (i * 0.05)
         }
-        for p in (perspectives or ["General"]) for i in (1, 2)
+        for i in range(1, 5)
     ]
     yield ev(type="stage", stage="critique")
     await asyncio.sleep(0.4)
     yield ev(type="stage", stage="synthesize")
     await asyncio.sleep(0.4)
+    yield ev(type="stage", stage="verify")
+    await asyncio.sleep(0.4)
     yield ev(type="stage", stage="epistemic")
     await asyncio.sleep(0.4)
-    ids = [e["id"] for e in evidence]
+    
+    valid_ids = [e["id"] for e in evidence[:3]]
     yield ev(
         type="result",
         query_type="COMPLEX" if complex_q else "SIMPLE",
         perspectives=perspectives,
         evidence=evidence,
-        validated_evidence_ids=ids[:-1],
+        validated_evidence_ids=valid_ids,
         conflicts=["Mock: sources disagree on migration cost."] if complex_q else [],
         weak_evidence=["Mock: one source is thin."] if complex_q else [],
         answer=(f"This is a mock answer to: {query}\n\n"
-                f"First point is supported [{ids[0]}].\n\nSecond point [{ids[1]}]."),
+                f"First point is supported [{valid_ids[0]}].\n\nSecond point [{valid_ids[1]}]."),
         limitations=["Mock: evidence is placeholder data.", "Mock: one claim is disputed."],
+        claim_verification={
+            "total_citations_found": 2,
+            "valid_citations": valid_ids[:2],
+            "invalid_citations": [],
+            "verification_passed": True,
+            "verification_notes": "All 2 citations verified against grounded evidence."
+        },
         epistemic={
             "known_facts": ["Mock fact A", "Mock fact B"],
             "uncertainties": ["Mock uncertainty"],
@@ -90,24 +109,28 @@ async def run_real(query: str) -> AsyncIterator[str]:
 
     p = GroqDeepResearchPipeline(model_name=MODEL)
 
+    # Stage 1: Classify
     yield ev(type="stage", stage="classify")
     c = await p.classify_query(query)
     yield ev(type="classified", query_type=c.query_type, reasoning=c.reasoning)
 
-    evidence = []
+    raw_evidence = []
     perspective_names = []
     if c.query_type == "SIMPLE":
         yield ev(type="stage", stage="collect")
-        evidence = await p.collect_evidence(
+        raw_evidence = await p.collect_evidence(
             query=query, 
             perspective_name="General", 
             search_queries=[query]
         )
     else:
+        # Stage 2: Perspective Planning
         yield ev(type="stage", stage="plan")
         plan = await p.plan_perspectives(query)
         perspective_names = [x.name for x in plan.perspectives]
         yield ev(type="perspectives", perspectives=perspective_names)
+        
+        # Stage 3: Evidence Collection
         yield ev(type="stage", stage="collect")
         results = await asyncio.gather(*[
             p.collect_evidence(
@@ -118,17 +141,30 @@ async def run_real(query: str) -> AsyncIterator[str]:
             for pers in plan.perspectives
         ])
         for r in results:
-            evidence.extend(r)
+            raw_evidence.extend(r)
 
+    # FIX 1: Clean sequential ID assignment (doc_1, doc_2...)
+    evidence = p.assign_sequential_ids(raw_evidence)
+
+    # Stage 4: Evidence Critique
     yield ev(type="stage", stage="critique")
     crit = await p.critique_evidence(query, evidence)
     valid = [e for e in evidence if e.id in crit.validated_evidence_ids]
 
+    # Stage 5: Synthesis
     yield ev(type="stage", stage="synthesize")
     synthesis = await p.synthesize(query, valid, crit)
 
+    # Stage 6: Claim Verification (FIX 3)
+    yield ev(type="stage", stage="verify")
+    verification = await p.verify_claims(synthesis, valid)
+
+    # Stage 7: Epistemic State Memory
     yield ev(type="stage", stage="epistemic")
     state = await p.update_epistemic_memory(query, crit, synthesis)
+
+    # Separate limitations field
+    limitations = state.uncertainties + state.disputed_claims
 
     yield ev(
         type="result",
@@ -139,7 +175,8 @@ async def run_real(query: str) -> AsyncIterator[str]:
         conflicts=crit.conflicts_detected,
         weak_evidence=crit.weak_evidence_flagged,
         answer=synthesis,
-        limitations=state.uncertainties + state.disputed_claims,
+        limitations=limitations,
+        claim_verification=verification.model_dump(),
         epistemic=state.model_dump(),
     )
 

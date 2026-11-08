@@ -2,7 +2,7 @@ import asyncio
 import os
 import json
 import re
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from tavily import TavilyClient
@@ -42,6 +42,13 @@ class EvidenceCritique(BaseModel):
     weak_evidence_flagged: List[str] = Field(default_factory=list)
     validated_evidence_ids: List[str]
 
+class ClaimVerificationResult(BaseModel):
+    total_citations_found: int
+    valid_citations: List[str]
+    invalid_citations: List[str]
+    verification_passed: bool
+    verification_notes: str
+
 class EpistemicState(BaseModel):
     known_facts: List[str] = Field(default_factory=list)
     uncertainties: List[str] = Field(default_factory=list)
@@ -51,11 +58,12 @@ class EpistemicState(BaseModel):
 class FinalResearchOutput(BaseModel):
     synthesized_response: str
     limitations: List[str]
+    claim_verification: ClaimVerificationResult
     epistemic_summary: EpistemicState
 
 
 # ==========================================
-# 2. Groq Research Pipeline Engine
+# 2. Groq Deep Research Pipeline Engine
 # ==========================================
 
 class GroqDeepResearchPipeline:
@@ -122,7 +130,12 @@ class GroqDeepResearchPipeline:
         query: str, 
         perspective_name: str = "General",
         search_queries: Optional[List[str]] = None
-    ) -> List[EvidenceItem]:
+    ) -> List[Dict[str, Any]]:
+        """
+        Gathers raw search results. ID assignment is handled globally after 
+        all evidence is collected to ensure clean sequential IDs (doc_1, doc_2...).
+        Handles single-query search failures gracefully without crashing.
+        """
         print(f"  └─ Gathering evidence via Tavily for perspective: [{perspective_name}]")
         queries = search_queries or [query]
 
@@ -136,33 +149,56 @@ class GroqDeepResearchPipeline:
             for search_query in queries
         ]
         
-        responses = await asyncio.gather(*tasks)
+        # FIX 6: return_exceptions=True prevents single query timeouts from breaking pipeline
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        raw_items = []
+
+        for response in responses:
+            if isinstance(response, Exception):
+                print(f"  └─ [Warning] Search task failed: {response}")
+                continue
+
+            for result in response.get("results", []):
+                raw_items.append({
+                    "title": result.get("title"),
+                    "source": result.get("title") or result.get("url") or "Unknown Source",
+                    "url": result.get("url"),
+                    "perspective": perspective_name,
+                    "content": result.get("content", "No content retrieved."),
+                    "relevance_score": result.get("score")
+                })
+
+        return raw_items
+
+    def assign_sequential_ids(self, raw_evidence: List[Dict[str, Any]]) -> List[EvidenceItem]:
+        """
+        FIX 1: Assigns short, clean sequential IDs (doc_1, doc_2...) globally after deduplication.
+        """
         evidence_items = []
         seen_urls = set()
         counter = 1
 
-        for response in responses:
-            for result in response.get("results", []):
-                url = result.get("url")
-                if url and url in seen_urls:
-                    continue
-                if url:
-                    seen_urls.add(url)
+        for item in raw_evidence:
+            url = item.get("url")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
 
-                doc_id = f"doc_{perspective_name.lower().replace(' ', '_')}_{counter}"
-                counter += 1
+            doc_id = f"doc_{counter}"
+            counter += 1
 
-                evidence_items.append(
-                    EvidenceItem(
-                        id=doc_id,
-                        title=result.get("title"),
-                        source=result.get("title") or url or "Unknown Source",
-                        url=url,
-                        perspective=perspective_name,
-                        content=result.get("content", "No content retrieved."),
-                        relevance_score=result.get("score")
-                    )
+            evidence_items.append(
+                EvidenceItem(
+                    id=doc_id,
+                    title=item.get("title"),
+                    source=item.get("source"),
+                    url=url,
+                    perspective=item.get("perspective"),
+                    content=item.get("content"),
+                    relevance_score=item.get("relevance_score")
                 )
+            )
 
         return evidence_items
 
@@ -180,6 +216,10 @@ class GroqDeepResearchPipeline:
         return await self._parse_json_schema(prompt, EvidenceCritique)
 
     async def synthesize(self, query: str, valid_evidence: List[EvidenceItem], critique: EvidenceCritique) -> str:
+        """
+        FIX 2: Adds max_tokens limit and inspects finish_reason.
+        FIX 3: Explicit prompt rules for clean citation format.
+        """
         valid_ids = [e.id for e in valid_evidence]
         valid_ids_str = ", ".join(valid_ids) if valid_ids else "None"
         
@@ -191,14 +231,14 @@ class GroqDeepResearchPipeline:
         system_prompt = (
             "You are an expert research analyst.\n\n"
             "STRICT CITATION RULES:\n"
-            "1. Use square brackets ONLY for evidence citations (e.g. [doc_id]).\n"
+            "1. Use square brackets ONLY for evidence citations (e.g. [doc_1], [doc_2]).\n"
             "2. Every citation inside square brackets MUST correspond to an exact EvidenceItem ID from the list below.\n"
             "3. Never invent, abbreviate, or modify citation IDs.\n"
             "4. NEVER write bracketed labels such as [User], [Source], [Evidence], [Context], [Query], or [Unknown].\n"
             "5. If referring to the user's question, prompt, or scenario, write 'the user' without square brackets.\n"
             "6. Use ONLY claims supported by the validated evidence. Every factual claim must be traceable to at least one valid EvidenceItem ID.\n"
-            "7. If the evidence is insufficient, explicitly state that the claim cannot be established.\n\n"
-            f"VALID EVIDENCE IDs YOU ARE ALLOWED TO CITE: {valid_ids_str}"
+            "7. Format key comparisons using Markdown tables where applicable.\n\n"
+            f"VALID EVIDENCE IDs ALLOWED TO CITE: {valid_ids_str}"
         )
 
         user_prompt = (
@@ -215,21 +255,73 @@ class GroqDeepResearchPipeline:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1
+            temperature=0.1,
+            max_tokens=4096  # FIX 2: Explicit completion limit
         )
-        
-        synthesis_text = response.choices[0].message.content
 
-        # Post-processing fallback: remove non-doc bracketed labels like [User] or [Source] if any slipped through
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            print("  └─ [Warning] Synthesis response reached completion token limit (truncated).")
+
+        synthesis_text = choice.message.content or ""
+
+        # Cleanup non-doc bracketed labels like [User] if any slip through
         synthesis_text = re.sub(r'\[(User|Source|Evidence|Context|Query|Unknown)\]', r'\1', synthesis_text, flags=re.IGNORECASE)
 
         return synthesis_text
 
+    async def verify_claims(self, synthesis: str, valid_evidence: List[EvidenceItem]) -> ClaimVerificationResult:
+        """
+        FIX 3: Claim verification pipeline stage. Audits citations in synthesized response 
+        against valid evidence IDs.
+        """
+        valid_set = {e.id for e in valid_evidence}
+        
+        # Regex captures doc citations like [doc_1] or multi-citations [doc_1, doc_2]
+        raw_matches = re.findall(r'\[(doc_\d+(?:\s*,\s*doc_\d+)*)\]', synthesis)
+        
+        found_citations = []
+        for match in raw_matches:
+            ids = [i.strip() for i in match.split(',')]
+            found_citations.extend(ids)
+
+        found_citations = list(dict.fromkeys(found_citations))  # Unique ordered
+
+        valid_citations = [cid for cid in found_citations if cid in valid_set]
+        invalid_citations = [cid for cid in found_citations if cid not in valid_set]
+
+        passed = len(invalid_citations) == 0
+        notes = (
+            f"All {len(valid_citations)} citations verified against grounded evidence."
+            if passed else
+            f"Found {len(invalid_citations)} invalid/unsupported citation IDs: {invalid_citations}"
+        )
+
+        return ClaimVerificationResult(
+            total_citations_found=len(found_citations),
+            valid_citations=valid_citations,
+            invalid_citations=invalid_citations,
+            verification_passed=passed,
+            verification_notes=notes
+        )
+
     async def update_epistemic_memory(self, query: str, critique: EvidenceCritique, synthesis: str) -> EpistemicState:
+        """
+        FIX 4: Explicitly computes validated/weak counts & lists outside prompt and includes critique context.
+        FIX 5: Replaces 'Synthesis Draft:' with 'Synthesized Research Report:'.
+        """
+        validated_count = len(critique.validated_evidence_ids)
+        weak_count = len(critique.weak_evidence_flagged)
+
         prompt = (
-            f'Analyze the synthesis report and critique context for query "{query}".\n'
-            'Summarize current knowledge state into known_facts, uncertainties, disputed_claims, and unresolved_questions.\n\n'
-            f'Synthesis Draft:\n{synthesis}'
+            f'Analyze the synthesized research report and evidence critique for query "{query}".\n'
+            'Categorize current knowledge state into known_facts, uncertainties, disputed_claims, and unresolved_questions.\n\n'
+            f'Critique Metadata:\n'
+            f'- Validated Evidence Count: {validated_count}\n'
+            f'- Flagged Weak Evidence Count: {weak_count}\n'
+            f'- Identified Conflicts: {critique.conflicts_detected}\n'
+            f'- Weak Evidence Items: {critique.weak_evidence_flagged}\n\n'
+            f'Synthesized Research Report:\n{synthesis}'  # FIX 5: Replaced 'Draft' wording
         )
         return await self._parse_json_schema(prompt, EpistemicState)
 
@@ -238,13 +330,15 @@ class GroqDeepResearchPipeline:
         print(f"Starting Pipeline using Groq [{self.model}]")
         print(f"==========================================\n")
 
+        # 1. Classification
         classification = await self.classify_query(user_query)
         print(f"[Query Classifier] Classified as: {classification.query_type}")
 
-        all_evidence: List[EvidenceItem] = []
+        raw_evidence: List[Dict[str, Any]] = []
 
+        # 2. Perspective Planning & Parallel Collection
         if classification.query_type == "SIMPLE":
-            all_evidence = await self.collect_evidence(
+            raw_evidence = await self.collect_evidence(
                 query=user_query,
                 perspective_name="General",
                 search_queries=[user_query]
@@ -263,17 +357,32 @@ class GroqDeepResearchPipeline:
             ]
             results = await asyncio.gather(*tasks)
             for res in results:
-                all_evidence.extend(res)
+                raw_evidence.extend(res)
 
+        # FIX 1: Assign clean sequential IDs (doc_1, doc_2...) globally
+        all_evidence = self.assign_sequential_ids(raw_evidence)
+        print(f"\n[Evidence Collector] Total unique items retrieved: {len(all_evidence)}")
+
+        # 3. Evidence Critic
         critique = await self.critique_evidence(user_query, all_evidence)
         valid_evidence = [e for e in all_evidence if e.id in critique.validated_evidence_ids]
 
+        # 4. Synthesis
         synthesis = await self.synthesize(user_query, valid_evidence, critique)
+
+        # 5. Claim Verification (FIX 3)
+        verification = await self.verify_claims(synthesis, valid_evidence)
+
+        # 6. Epistemic Memory Update (FIX 4 & FIX 5)
         epistemic_state = await self.update_epistemic_memory(user_query, critique, synthesis)
+
+        # Separate limitations field
+        limitations = epistemic_state.uncertainties + epistemic_state.disputed_claims
 
         return FinalResearchOutput(
             synthesized_response=synthesis,
-            limitations=epistemic_state.uncertainties + epistemic_state.disputed_claims,
+            limitations=limitations,
+            claim_verification=verification,
             epistemic_summary=epistemic_state
         )
 
