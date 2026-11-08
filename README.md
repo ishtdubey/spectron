@@ -27,6 +27,7 @@ The output is a cited report with limitations, supporting evidence, and a collap
 ## Features
 
 - Chat shell with live, per-stage progress streamed from the backend.
+- Real-time web evidence retrieval using Tavily, with concurrent perspective-specific searches and URL deduplication within each perspective.
 - Cited report output with `[doc_id]` citations rendered as chips.
 - Invalid-citation detection: a chip turns red if its id is not in the retrieved evidence.
 - Separate sections for limitations and evidence.
@@ -174,7 +175,14 @@ python tools/test_api.py --real    # real pipeline (needs keys in backend/.env)
 ## How it works
 
 1. The UI sends the user's query to the backend.
-2. `server.py` executes the pipeline stages in order, the same ones `GroqDeepResearchPipeline.run()` performs.
+2. `server.py` executes the pipeline stages in order, the same ones `GroqDeepResearchPipeline.run()` performs:
+
+   ```
+   classify query
+       ├─ SIMPLE  → collect evidence (single query, "General" perspective)
+       └─ other   → plan perspectives → collect evidence per perspective (concurrent)
+   critique evidence → synthesize cited report → update epistemic state
+   ```
 3. After each stage, the server writes one JSON line to the response stream.
 4. `frontend/src/api.js` reads the stream line by line and dispatches events.
 5. `App.jsx` holds the chat state. `components.jsx` renders:
@@ -198,7 +206,7 @@ The report text contains citations in the form `[doc_id]`. The UI converts each 
 | UI shows `TAVILY_API_KEY is not set` | Same as above for the Tavily key |
 | UI cannot reach the backend | Backend not running on port 8000, or port mismatch with the frontend config in `vite.config.js` |
 | `test_groq.py` fails | Invalid or expired key, no network access, or the account lacks access to the configured model. Run `list_models.py` |
-| Evidence looks like placeholder text | Expected; see [Known limitations](#known-limitations) |
+| Evidence is missing or empty | Check that `TAVILY_API_KEY` is configured correctly and that the Tavily API request succeeds |
 | `LF will be replaced by CRLF` warnings on Windows | Harmless line-ending notices from Git |
 
 ## Security notes
@@ -210,6 +218,7 @@ The report text contains citations in the form `[doc_id]`. The UI converts each 
 
 ## Known limitations
 
-- `collect_evidence()` in `research_agent.py` still returns placeholder text, so evidence shown in the UI is placeholder until real retrieval is plugged in.
+- Evidence retrieval depends on the Tavily search API. Search result quality, availability, and coverage depend on the external API and the generated search queries.
+- Search results are limited to a small number of results per query and may not represent all relevant perspectives or sources.
 - No login. There is one shared conversation per browser tab, and nothing is stored between reloads.
 - No rate limiting or request queueing on the backend.
