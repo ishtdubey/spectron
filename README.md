@@ -52,7 +52,7 @@ The output is a cited report with limitations, supporting evidence, and a collap
 ## Project layout
 
 ```
-research-ui/
+spectron/
 ├── README.md
 ├── .gitignore
 ├── backend/
